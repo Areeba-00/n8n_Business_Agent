@@ -1,0 +1,612 @@
+{
+  "name": "Vapi Voice Agent + Lawmatics (Inbound & Outbound)",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "vapi-inbound",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "f8027c9e-b904-4710-94b0-067872c900e5",
+      "name": "Vapi Tool Calls (Inbound)",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "position": [
+        200,
+        300
+      ],
+      "webhookId": "c39bf2b4-4b40-4ce5-a810-96248054c6cb"
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "// Normalize the incoming voice-platform tool/function call into ONE item.\n// Works with Vapi (message.toolCallList / message.toolCalls) and Retell ({ name, args }).\nconst root = $input.first().json || {};\nconst body = root.body || root;            // n8n nests webhook payloads under .body\nconst msg  = body.message || {};\n\n// --- Vapi shape ---\nconst calls = msg.toolCallList || msg.toolCalls || body.toolCalls || [];\nlet call = Array.isArray(calls) ? (calls[0] || {}) : {};\nlet fn   = call.function || {};\nlet toolCallId   = call.id || '';\nlet functionName = fn.name || '';\nlet args         = fn.arguments;\n\n// --- Retell shape (fallback) ---\nif (!functionName && body.name) {\n  functionName = body.name;\n  args = body.args;\n  toolCallId = (body.call && body.call.call_id) || '';\n}\n\n// arguments can arrive as a JSON string\nif (typeof args === 'string') {\n  try { args = JSON.parse(args); } catch (e) { args = {}; }\n}\nargs = args || {};\n\nreturn [{ json: { toolCallId, functionName, args, _raw: body } }];\n"
+      },
+      "id": "0fedb0c5-e813-49e4-a348-703bde38d4fa",
+      "name": "Parse Tool Call",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        420,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": false,
+                  "leftValue": "",
+                  "typeValidation": "loose",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "0fbdea29-e681-4c82-ad10-ea4be45d859e",
+                    "leftValue": "={{ $json.functionName }}",
+                    "rightValue": "check_availability",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "check_availability"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": false,
+                  "leftValue": "",
+                  "typeValidation": "loose",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "eb2e5a9b-e62b-4490-b9c4-b76dadee9e1c",
+                    "leftValue": "={{ $json.functionName }}",
+                    "rightValue": "book_appointment",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "book_appointment"
+            }
+          ]
+        },
+        "options": {
+          "fallbackOutput": "extra",
+          "renameFallbackOutput": "fallback"
+        }
+      },
+      "id": "eb33252b-dea0-4788-aa75-bf9ae19b25d2",
+      "name": "Route by Function",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.4,
+      "position": [
+        640,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "// Generate open business-hour slots for the requested date (no external dependency).\n// Tip: later, query Lawmatics Events for the date and remove already-booked times.\nconst args = ($input.first().json || {}).args || {};\n\nlet dateStr = (args.date || args.day || '').toString().trim();\nlet base;\nif (/^\\d{4}-\\d{2}-\\d{2}/.test(dateStr)) {\n  base = new Date(dateStr.slice(0, 10) + 'T12:00:00');\n} else {\n  base = new Date();\n  base.setDate(base.getDate() + 1); // default: tomorrow\n}\n\nconst weekday  = base.toLocaleDateString('en-US', { weekday: 'long' });\nconst niceDate = base.toLocaleDateString('en-US', { month: 'long', day: 'numeric' });\n\n// 9 AM, 11 AM, 2 PM\nconst startHours = [9, 11, 14];\nconst label = (h) => {\n  const ampm = h >= 12 ? 'PM' : 'AM';\n  const hr = ((h + 11) % 12) + 1;\n  return hr + ':00 ' + ampm;\n};\nconst slots = startHours.map(label);\nconst result = 'I have a few openings on ' + weekday + ', ' + niceDate +\n  ': ' + slots.join(', ') + '. Which time works best for you?';\n\nreturn [{ json: { result, date: base.toISOString().slice(0, 10), slots } }];\n"
+      },
+      "id": "d1d47948-f4bd-4dcc-b7c9-a6d55b58bb7d",
+      "name": "Compute Available Slots",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        900,
+        140
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "// Normalize booking arguments and compute ISO start/end times for Lawmatics.\nconst args = ($input.first().json || {}).args || {};\n\nconst fullName = (args.name || args.full_name || '').toString().trim();\nconst parts = fullName.split(/\\s+/).filter(Boolean);\nconst firstName = parts[0] || 'Unknown';\nconst lastName  = parts.slice(1).join(' ') || 'Caller';\n\nconst raw = (args.datetime || args.start_time || args.start || args.time || '').toString().trim();\nlet start = new Date(raw);\nif (isNaN(start.getTime())) {\n  start = new Date();\n  start.setDate(start.getDate() + 1);\n  start.setHours(10, 0, 0, 0); // fallback: tomorrow 10:00\n}\nconst durationMin = Number(args.duration_minutes || args.duration || 30) || 30;\nconst end = new Date(start.getTime() + durationMin * 60000);\n\nconst reason = (args.reason || args.matter || 'Consultation').toString();\n\nreturn [{\n  json: {\n    firstName,\n    lastName,\n    fullName: fullName || (firstName + ' ' + lastName),\n    email: args.email || '',\n    phone: args.phone || '',\n    reason,\n    startISO: start.toISOString(),\n    endISO:   end.toISOString(),\n    appointmentName: 'Consultation with ' + firstName + ' ' + lastName\n  }\n}];\n"
+      },
+      "id": "2209dc9a-9c45-47b1-a96a-8f74914ee529",
+      "name": "Prepare Appointment Data",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        900,
+        320
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.lawmatics.com/v1/prospects",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "contentType": "json",
+        "specifyBody": "json",
+        "jsonBody": "={{ { \"first_name\": $json.firstName, \"last_name\": $json.lastName, \"email\": $json.email, \"phone\": $json.phone } }}",
+        "options": {}
+      },
+      "id": "8b4a7dfd-48a7-4a39-aeee-f826846a612a",
+      "name": "Lawmatics: Create Prospect",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        1140,
+        320
+      ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "REPLACE_LAWMATICS_CRED",
+          "name": "Lawmatics Header Auth"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.lawmatics.com/v1/events",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "contentType": "json",
+        "specifyBody": "json",
+        "jsonBody": "={{ { \"name\": $('Prepare Appointment Data').item.json.appointmentName, \"description\": $('Prepare Appointment Data').item.json.reason, \"start_date\": $('Prepare Appointment Data').item.json.startISO, \"end_date\": $('Prepare Appointment Data').item.json.endISO, \"all_day\": false, \"contact_id\": (($('Lawmatics: Create Prospect').item.json || {}).data || {}).id } }}",
+        "options": {}
+      },
+      "id": "e831ca30-5646-45db-b5fe-0fc005a2520a",
+      "name": "Lawmatics: Create Appointment",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        1380,
+        320
+      ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "REPLACE_LAWMATICS_CRED",
+          "name": "Lawmatics Header Auth"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "// Build the spoken confirmation string from the Lawmatics response.\nconst prep = $('Prepare Appointment Data').first().json || {};\nconst resp = $input.first().json || {};\n\nconst created = !!(resp && (resp.data || resp.id));\nconst apptId  = (resp.data && resp.data.id) || resp.id || null;\n\nlet when = prep.startISO;\ntry {\n  when = new Date(prep.startISO).toLocaleString('en-US', {\n    weekday: 'long', month: 'long', day: 'numeric',\n    hour: 'numeric', minute: '2-digit'\n  });\n} catch (e) {}\n\nlet result;\nif (created) {\n  result = 'Perfect, ' + prep.firstName + '. Your consultation is booked for ' + when +\n    '. We will send a confirmation to ' + (prep.email || 'your email') +\n    '. Is there anything else I can help you with?';\n} else {\n  result = 'Thanks ' + prep.firstName + '. I have noted your request for ' + when +\n    ', and our team will confirm shortly. Is there anything else I can help with?';\n}\n\nreturn [{ json: { result, appointmentId: apptId } }];\n"
+      },
+      "id": "c193e2df-4479-4413-b5bb-162c69049aad",
+      "name": "Build Booking Confirmation",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1620,
+        320
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "manual",
+        "assignments": {
+          "assignments": [
+            {
+              "id": "56a34896-acd7-42ef-ae98-1aa8622d8d88",
+              "name": "result",
+              "type": "string",
+              "value": "I'm sorry, I didn't quite catch that. Would you like to check availability or book an appointment?"
+            }
+          ]
+        },
+        "includeOtherFields": false,
+        "options": {}
+      },
+      "id": "48e20ee4-c969-46b4-969d-79a3ff900802",
+      "name": "Unknown Request",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        900,
+        500
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ { \"results\": [ { \"toolCallId\": $('Parse Tool Call').first().json.toolCallId, \"result\": $json.result } ] } }}",
+        "options": {
+          "responseCode": 200
+        }
+      },
+      "id": "1da7b05c-9078-42b5-a51c-654d1fdf2457",
+      "name": "Respond to Vapi",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.5,
+      "position": [
+        1880,
+        320
+      ]
+    },
+    {
+      "parameters": {},
+      "id": "6206e22b-4cef-4ab2-b5a1-41192660accf",
+      "name": "Run Outbound Call (Manual)",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        200,
+        960
+      ]
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "days",
+              "daysInterval": 1,
+              "triggerAtHour": 9
+            }
+          ]
+        }
+      },
+      "id": "eb4e0d30-fea0-487d-b4fa-c6658332c079",
+      "name": "Outbound Schedule",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.3,
+      "position": [
+        200,
+        1140
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "manual",
+        "assignments": {
+          "assignments": [
+            {
+              "id": "a3167876-f246-4a60-b091-994498d2bdb5",
+              "name": "name",
+              "type": "string",
+              "value": "Jane Doe"
+            },
+            {
+              "id": "74bf433d-7fac-459e-9850-a445ca77d71b",
+              "name": "phone",
+              "type": "string",
+              "value": "+15551234567"
+            },
+            {
+              "id": "a406dc5e-de7b-47db-809e-a685b06fea58",
+              "name": "email",
+              "type": "string",
+              "value": "jane@example.com"
+            },
+            {
+              "id": "9664e1d8-b806-42a1-a204-b20ae1c92c0a",
+              "name": "reason",
+              "type": "string",
+              "value": "Initial consultation"
+            },
+            {
+              "id": "4bbb33d5-f53e-43e5-859f-c3f57d51a751",
+              "name": "vapiAssistantId",
+              "type": "string",
+              "value": "YOUR_VAPI_ASSISTANT_ID"
+            },
+            {
+              "id": "54a6e7f9-1ca8-49bc-ba52-f02337b9cb80",
+              "name": "vapiPhoneNumberId",
+              "type": "string",
+              "value": "YOUR_VAPI_PHONE_NUMBER_ID"
+            }
+          ]
+        },
+        "includeOtherFields": false,
+        "options": {}
+      },
+      "id": "0d28fb74-5d58-485c-ade3-7890580bcd02",
+      "name": "Define Lead",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        460,
+        1040
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "136186a3-65cd-4f8a-9428-20109b4cea66",
+              "leftValue": "={{ $json.phone }}",
+              "rightValue": "",
+              "operator": {
+                "type": "string",
+                "operation": "notEmpty",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "39932c03-0c0e-421e-b347-4a02af3cf9a5",
+      "name": "Has Phone Number?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        700,
+        1040
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.vapi.ai/call",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpBearerAuth",
+        "sendBody": true,
+        "contentType": "json",
+        "specifyBody": "json",
+        "jsonBody": "={{ { \"assistantId\": $json.vapiAssistantId, \"phoneNumberId\": $json.vapiPhoneNumberId, \"customer\": { \"number\": $json.phone, \"name\": $json.name, \"numberE164CheckEnabled\": true }, \"assistantOverrides\": { \"variableValues\": { \"customer_name\": $json.name, \"reason\": $json.reason } } } }}",
+        "options": {}
+      },
+      "id": "ae011620-ebc7-42e9-919f-1980f7f7e7c1",
+      "name": "Vapi: Create Outbound Call",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        940,
+        1040
+      ],
+      "credentials": {
+        "httpBearerAuth": {
+          "id": "REPLACE_VAPI_CRED",
+          "name": "Vapi Bearer Auth"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "content": "## ☎️ INBOUND — Vapi Tool Server\nVapi / Retell call these webhook tools **during a live call**.\n\n1. Copy this Webhook's **Production URL** → paste it as the **Server URL** of your Vapi tool(s).\n2. Create 2 tools in Vapi: `check_availability` and `book_appointment` (parameter schemas are in the README).\n3. The reply is auto-formatted the way Vapi expects:\n   `{ \"results\": [ { \"toolCallId\", \"result\" } ] }`\n\n🔁 **For Retell**: change the *Respond to Vapi* node body to\n`={{ { \"result\": $json.result } }}`\n(Retell sends `body.name` + `body.args` — already handled in *Parse Tool Call*.)",
+        "height": 300,
+        "width": 1760,
+        "color": 5
+      },
+      "id": "55413d7f-68b3-4040-b54a-21d806b29a16",
+      "name": "Sticky Note - Inbound",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        180,
+        -40
+      ]
+    },
+    {
+      "parameters": {
+        "content": "## 📞 OUTBOUND — Vapi Caller\nInitiates calls through the Vapi API.\n\n▶ Click **Run Outbound Call (Manual)** to test one lead, or\nactivate **Outbound Schedule** for automated calling.\n\nEdit **Define Lead** with your Vapi Assistant ID + Phone Number ID.\nFor bulk calling, replace *Define Lead* with a Lawmatics\n**GET /v1/prospects** + a **Loop Over Items** node.",
+        "height": 300,
+        "width": 760,
+        "color": 4
+      },
+      "id": "96413525-1f7d-4ba1-9106-b37e05eb6646",
+      "name": "Sticky Note - Outbound",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        180,
+        760
+      ]
+    },
+    {
+      "parameters": {
+        "content": "## 🔑 SETUP\n**Create these credentials (Credentials → Create new):**\n• **Lawmatics** → *Header Auth*: Name = `Authorization`,\n  Value = `Bearer YOUR_LAWMATICS_TOKEN`\n• **Vapi** → *Bearer Auth*: Token = `YOUR_VAPI_PRIVATE_KEY`\n\n**Lawmatics endpoints used** (appointments = “Events”):\n• POST .../v1/prospects → contact / lead\n• POST .../v1/events    → appointment\nVerify field names against your account's API docs; you may need to add\n`event_type_id` / `users`.\n\n⚠️ Sample lead uses a fake number + placeholder IDs, so nothing\ndials until you configure it.",
+        "height": 300,
+        "width": 700,
+        "color": 3
+      },
+      "id": "8a20272b-0e2b-400f-859e-a9be3163d519",
+      "name": "Sticky Note - Setup",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        1000,
+        760
+      ]
+    }
+  ],
+  "connections": {
+    "Vapi Tool Calls (Inbound)": {
+      "main": [
+        [
+          {
+            "node": "Parse Tool Call",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Tool Call": {
+      "main": [
+        [
+          {
+            "node": "Route by Function",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Route by Function": {
+      "main": [
+        [
+          {
+            "node": "Compute Available Slots",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Prepare Appointment Data",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Unknown Request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Compute Available Slots": {
+      "main": [
+        [
+          {
+            "node": "Respond to Vapi",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Appointment Data": {
+      "main": [
+        [
+          {
+            "node": "Lawmatics: Create Prospect",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Lawmatics: Create Prospect": {
+      "main": [
+        [
+          {
+            "node": "Lawmatics: Create Appointment",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Lawmatics: Create Appointment": {
+      "main": [
+        [
+          {
+            "node": "Build Booking Confirmation",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Booking Confirmation": {
+      "main": [
+        [
+          {
+            "node": "Respond to Vapi",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Unknown Request": {
+      "main": [
+        [
+          {
+            "node": "Respond to Vapi",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Run Outbound Call (Manual)": {
+      "main": [
+        [
+          {
+            "node": "Define Lead",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Outbound Schedule": {
+      "main": [
+        [
+          {
+            "node": "Define Lead",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Define Lead": {
+      "main": [
+        [
+          {
+            "node": "Has Phone Number?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Has Phone Number?": {
+      "main": [
+        [
+          {
+            "node": "Vapi: Create Outbound Call",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        []
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "pinData": {},
+  "meta": {
+    "templateCredsSetupCompleted": false
+  }
+}
